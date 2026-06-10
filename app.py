@@ -1,28 +1,27 @@
-# app.py — SparklingBlu Moto | Weekly Driver Performance Tracker
-# Views: admin | drivers | fleet | team
+# app.py — SparklingBlu Fleet Management System
+# Phase 1: Live Uber API data | Views: admin | drivers | fleet | team
 
 import streamlit as st
 import pandas as pd
-import json
 from datetime import datetime
-from engine import (
-    calculate_performance_score, get_coaching_message,
-    get_week_progress, get_remaining_targets,
-    kpi_fully_met, WEEKLY_TARGETS,
-)
-from teams import TEAMS, SBV_DRIVERS, match_drivers_to_teams, mark_sbv_drivers
+from engine import get_week_progress
+from teams import TEAMS, match_drivers_to_teams
 from storage import save_fleet_data, load_fleet_data, is_storage_configured
+from uber_client import fetch_live_driver_data, UberAPIError
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="SparklingBlu — Driver Performance",
-                   page_icon="🚛", layout="wide")
+st.set_page_config(
+    page_title="SparklingBlu — Driver Performance",
+    page_icon="🚛",
+    layout="wide"
+)
 
 st.markdown("""
 <style>
 [data-testid="stAppViewContainer"],[data-testid="stMain"],.main{background:#f0f4f8!important;}
 [data-testid="stAppViewContainer"] p,[data-testid="stAppViewContainer"] span,
 [data-testid="stAppViewContainer"] div,[data-testid="stAppViewContainer"] label,
-[data-testid="stMarkdownContainer"] p,[data-testid="stMarkdownContainer"] span,
+[data-testid="stMarkdownContainer"] p,[data-testdata="stMarkdownContainer"] span,
 [data-testid="stMarkdownContainer"] li{color:#0f2027!important;}
 h1,h2,h3{color:#0f2027!important;}
 [data-testid="stMetric"]{background:white!important;border-radius:14px!important;
@@ -45,102 +44,22 @@ h1,h2,h3{color:#0f2027!important;}
 """, unsafe_allow_html=True)
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
-BASE_URL   = "https://fleet-app-v25cphks3psbb94zeedjfq.streamlit.app"
-SBV_TOTAL  = len(SBV_DRIVERS)
+BASE_URL = "https://fleet-app-v25cphks3psbb94zeedjfq.streamlit.app"
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
-def fmt_rate(v):
-    try:    return f"{round(float(v)*100)}%"
-    except: return str(v)
-
-def fmt_bool(v):
-    if v in [True,1,"True","YES"]: return "YES"
-    if v in [False,0,"False","NO"]: return "NO"
-    return str(v)
-
 def date_only():
     return datetime.now().strftime("%d %b %Y")
 
 def make_link(view, team=None):
     if team:
-        return f"{BASE_URL}/?view={view}&team={team.replace(' ','+')}"
+        return f"{BASE_URL}/?view={view}&team={team.replace(' ', '+')}"
     return f"{BASE_URL}/?view={view}"
-
-def recompute_kpi(df, report_days=1):
-    """
-    Recalculates KPI Met from weekly totals — NOT daily averages.
-
-    KPI is MET when ALL four conditions are true:
-      - Total hours online >= 50
-      - Total trips taken  >= 30
-      - Acceptance Rate    >= 80%
-      - Cancellation Rate  <= 5%
-
-    Daily targets (10h/day, 5 trips/day) are coaching pace guides only.
-    They must NOT be used for final KPI compliance — a driver who works
-    52h over 6 days averages 8.7h/day but has clearly hit the weekly target.
-
-    Handles both old column names (Daily Hrs Avg / Daily Trips Avg)
-    and new column names (Hours Online (weekly) / Trips (weekly)).
-    """
-    df = df.copy()
-
-    # Resolve hours column — support both old and new naming
-    if "Hours Online (weekly)" in df.columns:
-        hrs_col = "Hours Online (weekly)"
-    elif "Daily Hrs Avg" in df.columns:
-        hrs_col = "Daily Hrs Avg"
-    elif "Hours Online" in df.columns:
-        hrs_col = "Hours Online"
-    else:
-        hrs_col = None
-
-    # Resolve trips column — support both old and new naming
-    if "Trips (weekly)" in df.columns:
-        trp_col = "Trips (weekly)"
-    elif "Daily Trips Avg" in df.columns:
-        trp_col = "Daily Trips Avg"
-    elif "Trips Taken" in df.columns:
-        trp_col = "Trips Taken"
-    else:
-        trp_col = None
-
-    # KPI compliance = weekly totals vs weekly targets (no division by days)
-    if hrs_col and trp_col:
-        df["KPI Met"] = (
-            (df["Confirmation Rate"].astype(float) >= 0.80) &
-            (df["Cancellation Rate"].astype(float) <= 0.05) &
-            (df[hrs_col].astype(float) >= 50.0) &
-            (df[trp_col].astype(float) >= 30.0)
-        )
-    else:
-        df["KPI Met"] = (
-            (df["Confirmation Rate"].astype(float) >= 0.80) &
-            (df["Cancellation Rate"].astype(float) <= 0.05)
-        )
-
-    # Ensure display columns exist — migrate from old names if needed
-    if "Hours Online (weekly)" not in df.columns and hrs_col:
-        df["Hours Online (weekly)"] = df[hrs_col]
-    if "Trips (weekly)" not in df.columns and trp_col:
-        df["Trips (weekly)"] = df[trp_col]
-
-    return df
 
 def banner_html(text):
     return (
         f'<div style="background:linear-gradient(90deg,#0f2027,#203a43,#2c5364);'
         f'color:white;padding:14px 22px;border-radius:12px;margin-bottom:18px;font-size:14px;">'
         f'{text}</div>'
-    )
-
-def sbv_bar_html(line1, line2=""):
-    return (
-        f'<div style="background:white;border-radius:12px;padding:16px 22px;'
-        f'border-left:5px solid #2c5364;margin-bottom:16px;color:#0f2027;">'
-        f'{line1}'
-        + (f'<br><span style="color:#0f2027;font-size:13px;">{line2}</span>' if line2 else "")
-        + '</div>'
     )
 
 def insight_html(text):
@@ -158,49 +77,41 @@ def link_html(url):
         f'margin-top:6px;display:block;letter-spacing:0.3px;">{url}</div>'
     )
 
-# ── PROCESS CSV ───────────────────────────────────────────────────────────────
-def process_dataframe(raw, report_days, week_info):
-    scores, statuses, coachings = [], [], []
-    hrs_needed, trps_needed     = [], []
-    ar_ok, cr_ok, hrs_ok, trps_ok = [], [], [], []
-    hrs_weekly, trps_weekly     = [], []
-    kpi_met_list                = []
+def sbv_bar_html(line1, line2=""):
+    return (
+        f'<div style="background:white;border-radius:12px;padding:16px 22px;'
+        f'border-left:5px solid #2c5364;margin-bottom:16px;color:#0f2027;">'
+        f'{line1}'
+        + (f'<br><span style="color:#0f2027;font-size:13px;">{line2}</span>' if line2 else "")
+        + '</div>'
+    )
 
-    for _, row in raw.iterrows():
-        rem = get_remaining_targets(
-            row["Hours Online"], row["Trips Taken"],
-            row["Confirmation Rate"], row["Cancellation Rate"],
-            week_info["progress"], report_days
-        )
-        score = calculate_performance_score(
-            row["Confirmation Rate"], row["Cancellation Rate"],
-            row["Hours Online"], row["Trips Taken"], report_days
-        )
-        status, coaching = get_coaching_message(score, rem, week_info)
-        kpi = kpi_fully_met(
-            row["Hours Online"], row["Trips Taken"],
-            row["Confirmation Rate"], row["Cancellation Rate"], report_days
-        )
-        scores.append(score);    statuses.append(status);   coachings.append(coaching)
-        hrs_needed.append(rem["hours_needed"]); trps_needed.append(rem["trips_needed"])
-        ar_ok.append(rem["ar_on_track"]);       cr_ok.append(rem["cr_on_track"])
-        hrs_ok.append(rem["hours_on_track"]);   trps_ok.append(rem["trips_on_track"])
-        hrs_weekly.append(rem["hours_weekly"]); trps_weekly.append(rem["trips_weekly"])
-        kpi_met_list.append(kpi)
+# ── PROCESS API DATAFRAME ─────────────────────────────────────────────────────
+def process_api_dataframe(raw_df):
+    """
+    Takes a DataFrame from uber_client.fetch_live_driver_data() and enriches it
+    with team assignments and placeholder fields for future scoring.
 
-    df = raw.copy()
-    df["Score"]                = scores
-    df["Status"]               = statuses
-    df["Coaching"]             = coachings
-    df["Hours Needed"]         = hrs_needed
-    df["Trips Needed"]         = trps_needed
-    df["AR On Track"]          = ar_ok
-    df["CR On Track"]          = cr_ok
-    df["Hours On Track"]       = hrs_ok
-    df["Trips On Track"]       = trps_ok
-    df["Hours Online (weekly)"]= hrs_weekly
-    df["Trips (weekly)"]       = trps_weekly
-    df["KPI Met"]              = kpi_met_list
+    Phase 1 columns expected from API:
+        Driver, Hours Online, Hours on Trip, Total Trips
+
+    Phase 1 columns added here:
+        Team, Score (0), Status ('—'), Coaching ('—')
+
+    Designed so that when engine.py is updated, Score/Status/Coaching can be
+    computed properly by passing the df rows through calculate_performance_score()
+    and get_coaching_message() — no structural changes needed.
+    """
+    df = raw_df.copy()
+
+    # Team assignment (reuses existing teams.py logic)
+    df = match_drivers_to_teams(df)
+
+    # Phase 1 placeholders — replaced when engine.py is updated
+    df["Score"]    = 0
+    df["Status"]   = "—"
+    df["Coaching"] = "Scoring coming soon."
+
     return df
 
 # ── ROUTE ─────────────────────────────────────────────────────────────────────
@@ -215,160 +126,140 @@ week_info  = get_week_progress()
 # ════════════════════════════════════════════════════════
 if view == "admin":
     st.markdown("# 🚛 SparklingBlu — Admin Panel")
-    st.caption("Upload CSV → process → publish links")
+    st.caption("Fetch live Uber data → review → publish links")
 
     if not is_storage_configured():
         st.warning("⚙️ One-time GitHub Gist setup needed. See Setup Guide below.")
 
     st.markdown(banner_html(
         f'Today: <strong style="color:white;">{week_info["day_name"]}, {date_only()}</strong>'
-        f' &nbsp;|&nbsp; Week: <strong style="color:white;">{round(week_info["progress"]*100,1)}%</strong> complete'
-        f' &nbsp;|&nbsp; <strong style="color:white;">{week_info["days_left"]} day(s)</strong> left'
+        f' &nbsp;|&nbsp; Week: <strong style="color:white;">'
+        f'{round(week_info["progress"] * 100, 1)}%</strong> complete'
+        f' &nbsp;|&nbsp; <strong style="color:white;">'
+        f'{week_info["days_left"]} day(s)</strong> left'
         f' &nbsp;|&nbsp; Shift: <strong style="color:white;">5:00am – 7:30pm</strong>'
-        f' &nbsp;|&nbsp; Targets: <strong style="color:white;">10h/day | 5 trips/day | 80% AR | 5% CR | 50h/week</strong>'
     ), unsafe_allow_html=True)
 
-    col_a, col_b = st.columns([3, 1])
-    with col_a:
-        uploaded = st.file_uploader("Upload Uber CSV", type=["csv"])
-        sbv_file = st.file_uploader(
-            "Update SBV Driver List (optional — upload new Vehicle_List.xlsx)",
-            type=["xlsx"]
-        )
-    with col_b:
-        report_days = st.number_input(
-            "Days this CSV covers", min_value=1, max_value=7, value=1,
-            help="e.g. Mon–Thu = 4"
-        )
+    # ── Date range selector ───────────────────────────────
+    st.markdown("### 📅 Select Reporting Period")
+    col_d1, col_d2, col_wl = st.columns(3)
+    with col_d1:
+        start_date = st.date_input("Start date", value=datetime.now().date())
+    with col_d2:
+        end_date = st.date_input("End date", value=datetime.now().date())
+    with col_wl:
         week_label = st.text_input("Week label", value=date_only())
 
-    # SBV list override from Excel
-    if sbv_file is not None:
-        try:
-            sbv_xl = pd.read_excel(sbv_file)
-            if "Driver" in sbv_xl.columns:
-                st.session_state["sbv_override"] = sbv_xl["Driver"].dropna().str.strip().tolist()
-                st.success(f"SBV list updated: {len(st.session_state['sbv_override'])} drivers loaded.")
-            else:
-                st.warning("Excel must have a 'Driver' column.")
-        except Exception as e:
-            st.error(f"Could not read Excel: {e}")
-
-    if uploaded is None:
-        st.info("Upload your Uber driver CSV file to get started.")
+    if start_date > end_date:
+        st.error("Start date must be before or equal to end date.")
         st.stop()
 
-    # ── Load & process ────────────────────────────────────
-    raw = pd.read_csv(uploaded)
-    raw["Driver"] = raw["Driver first name"] + " " + raw["Driver surname"]
-    raw = match_drivers_to_teams(raw)
+    # ── Fetch live data ───────────────────────────────────
+    st.markdown("### 🔄 Live Data")
 
-    if "sbv_override" in st.session_state:
-        from teams import is_sbv_driver_dynamic
-        override = st.session_state["sbv_override"]
-        raw["Is SBV"] = raw["Driver"].apply(lambda n: is_sbv_driver_dynamic(n, override))
-        active_sbv_list = override
-    else:
-        raw = mark_sbv_drivers(raw)
-        active_sbv_list = SBV_DRIVERS
+    fetch_col, status_col = st.columns([2, 3])
+    with fetch_col:
+        fetch_btn = st.button(
+            "🔄 Fetch Live Driver Data",
+            type="primary",
+            use_container_width=True
+        )
 
-    df = process_dataframe(raw, report_days, week_info)
+    if fetch_btn:
+        with st.spinner("Connecting to Uber API…"):
+            try:
+                raw_df = fetch_live_driver_data(
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat(),
+                )
+                st.session_state["api_df"]     = raw_df
+                st.session_state["api_fetched"] = True
+                st.session_state["api_error"]   = None
+            except UberAPIError as e:
+                st.session_state["api_error"]   = str(e)
+                st.session_state["api_fetched"] = False
+            except Exception as e:
+                st.session_state["api_error"]   = f"Unexpected error: {e}"
+                st.session_state["api_fetched"] = False
 
-    # ── SBV counts — derived ONLY from CSV ───────────────
-    sbv_df      = df[df["Is SBV"] == True]
-    sbv_in_csv  = len(sbv_df)
-    sbv_kpi     = int(sbv_df["KPI Met"].apply(lambda x: x in [True,1,"True","YES"]).sum())
-    sbv_pct     = round((sbv_kpi / sbv_in_csv) * 100) if sbv_in_csv else 0
+    # Show persistent error if fetch failed
+    if st.session_state.get("api_error"):
+        st.error(f"❌ API Error: {st.session_state['api_error']}")
+        with st.expander("🛠️ Troubleshooting"):
+            st.markdown("""
+- Check that `UBER_CLIENT_ID` and `UBER_CLIENT_SECRET` are set in Streamlit Secrets
+- Confirm your Uber app is approved for `solutions.suppliers.metrics.read`
+- Check that your org has active drivers in the selected date range
+- Review Uber Developer Dashboard for any app status issues
+            """)
+        st.stop()
 
-    st.markdown(sbv_bar_html(
-        f'🚛 <strong style="color:#0f2027;">SBV Drivers in this report:</strong>'
-        f' <span style="font-size:22px;font-weight:900;color:#0f2027;">'
-        f'&nbsp;{sbv_in_csv} / {SBV_TOTAL}</span>'
-        f'&nbsp;&nbsp;|&nbsp;&nbsp;'
-        f'<span style="color:#0f2027;">SBV KPI Compliant: <strong>{sbv_kpi} / {sbv_in_csv}</strong>'
-        f'&nbsp;&nbsp;|&nbsp;&nbsp;SBV Compliance Rate: <strong>{sbv_pct}%</strong></span>'
-    ), unsafe_allow_html=True)
+    # No data fetched yet
+    if not st.session_state.get("api_fetched"):
+        st.info("Select a date range and click **Fetch Live Driver Data** to load driver metrics.")
+        st.stop()
+
+    # ── Data loaded — process and display ────────────────
+    raw_df = st.session_state["api_df"]
+    df     = process_api_dataframe(raw_df)
+
+    st.success(f"✅ Loaded **{len(df)} drivers** from Uber API")
 
     # ── Fleet overview metrics ────────────────────────────
     st.subheader("Fleet Overview")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Drivers",          len(df))
-    c2.metric("Top Performers",         len(df[df["Score"] >= 85]))
-    c3.metric("Needs Attention",        len(df[(df["Score"] >= 50) & (df["Score"] < 70)]))
-    c4.metric("Needs Urgent Attention", len(df[df["Score"] < 50]))
+    c1.metric("Total Drivers",    len(df))
+
+    avg_hours = round(df["Hours Online"].astype(float).mean(), 1) if "Hours Online" in df.columns else "—"
+    avg_trips = round(df["Total Trips"].astype(float).mean(), 1) if "Total Trips"  in df.columns else "—"
+    total_trips = int(df["Total Trips"].astype(float).sum())      if "Total Trips"  in df.columns else "—"
+
+    c2.metric("Avg Hours Online", f"{avg_hours}h")
+    c3.metric("Avg Trips",        avg_trips)
+    c4.metric("Total Trips",      total_trips)
 
     st.divider()
 
-    # ── SBV Exploration expanders ─────────────────────────
-    # A: SBV drivers NOT in CSV
-    csv_names_lower = set(df["Driver"].str.strip().str.lower().tolist())
-    missing_from_csv = []
-    for sbv_name in active_sbv_list:
-        sbv_lower = sbv_name.strip().lower()
-        parts = sbv_lower.split()
-        found = False
-        for csv_name in csv_names_lower:
-            if len(parts) >= 2 and parts[0] in csv_name and parts[-1] in csv_name:
-                found = True; break
-            if sbv_lower in csv_name or csv_name in sbv_lower:
-                found = True; break
-        if not found:
-            missing_from_csv.append(sbv_name)
-
-    with st.expander(f"🔴 SBV Drivers NOT ONLINE this period ({len(missing_from_csv)} drivers)"):
-        if missing_from_csv:
-            miss_df = pd.DataFrame({"Driver": sorted(missing_from_csv)})
-            miss_df.index += 1
-            st.dataframe(miss_df, use_container_width=True)
-        else:
-            st.success("All SBV drivers appeared in the CSV.")
-
-    # B: SBV drivers in CSV but not assigned to a team
-    unassigned_sbv = df[(df["Is SBV"] == True) & (df["Team"] == "Unassigned")]
-    with st.expander(f"🟡 SBV Drivers NOT assigned to any team ({len(unassigned_sbv)} drivers)"):
-        if not unassigned_sbv.empty:
-            ua_df = unassigned_sbv[["Driver","Hours Online (weekly)","Trips (weekly)",
-                                     "Confirmation Rate","Cancellation Rate","Score","Status"]].copy()
-            ua_df["Confirmation Rate"] = ua_df["Confirmation Rate"].apply(fmt_rate)
-            ua_df["Cancellation Rate"] = ua_df["Cancellation Rate"].apply(fmt_rate)
-            st.dataframe(ua_df.sort_values("Score", ascending=False),
-                         use_container_width=True, hide_index=True)
-        else:
-            st.success("All SBV drivers in the CSV are assigned to a team.")
+    # ── Team breakdown ────────────────────────────────────
+    st.subheader("Team Breakdown")
+    team_cols = st.columns(len(TEAMS))
+    for i, (team_name, info) in enumerate(TEAMS.items()):
+        t_df = df[df["Team"] == team_name]
+        team_cols[i].metric(
+            team_name,
+            f"{len(t_df)} drivers",
+            f"Leader: {info['leader']}"
+        )
 
     st.divider()
 
     # ── Preview table ─────────────────────────────────────
-    with st.expander("Preview Full Driver Table"):
-        prev = df[["Driver","Team","Is SBV","Hours Online (weekly)","Trips (weekly)",
-                   "Confirmation Rate","Cancellation Rate","Score","Status","KPI Met"]].copy()
-        prev["Confirmation Rate"] = prev["Confirmation Rate"].apply(fmt_rate)
-        prev["Cancellation Rate"] = prev["Cancellation Rate"].apply(fmt_rate)
-        prev["KPI Met"]           = prev["KPI Met"].apply(fmt_bool)
-        st.dataframe(prev.sort_values("Score", ascending=False),
-                     use_container_width=True, hide_index=True)
+    with st.expander("📋 Preview Full Driver Table", expanded=True):
+        show_cols = ["Driver", "Team", "Hours Online", "Hours on Trip", "Total Trips"]
+        show_cols = [c for c in show_cols if c in df.columns]
+        preview   = df[show_cols].copy()
+        st.dataframe(
+            preview.sort_values("Hours Online", ascending=False)
+                   .reset_index(drop=True),
+            use_container_width=True,
+            hide_index=True
+        )
 
     st.divider()
 
     # ── Save & publish ────────────────────────────────────
-    encode_cols = [
-        "Driver","Team","Is SBV",
-        "Hours Online (weekly)","Trips (weekly)",
-        "Confirmation Rate","Cancellation Rate",
-        "Score","Status","Coaching",
-        "Hours Needed","Trips Needed",
-        "AR On Track","CR On Track","Hours On Track","Trips On Track","KPI Met"
-    ]
+    encode_cols = ["Driver", "Team", "Hours Online", "Hours on Trip",
+                   "Total Trips", "Score", "Status", "Coaching"]
+    encode_cols = [c for c in encode_cols if c in df.columns]
+
     payload = {
-        "fleet":        df[encode_cols].to_dict(orient="records"),
-        "week_info":    week_info,
-        "week_label":   week_label,
-        "report_days":  int(report_days),
-        "updated_at":   date_only(),
-        "sbv_in_csv":   sbv_in_csv,
-        "sbv_total":    SBV_TOTAL,
-        "sbv_kpi":      sbv_kpi,
-        "missing_sbv":  missing_from_csv,
+        "fleet":       df[encode_cols].to_dict(orient="records"),
+        "week_info":   week_info,
+        "week_label":  week_label,
+        "updated_at":  date_only(),
+        "start_date":  start_date.isoformat(),
+        "end_date":    end_date.isoformat(),
+        "total_drivers": len(df),
     }
 
     st.subheader("Publish & Share Links")
@@ -376,10 +267,13 @@ if view == "admin":
     if is_storage_configured():
         if st.button("📤 Publish Data & Update All Links", type="primary",
                      use_container_width=True):
-            with st.spinner("Saving to GitHub Gist..."):
+            with st.spinner("Saving to GitHub Gist…"):
                 ok = save_fleet_data(payload)
             if ok:
                 st.success("✅ Data published! All links now show the latest data.")
+                # Clear fetched state so admin can fetch fresh next time
+                st.session_state["api_fetched"] = False
+                st.session_state["api_df"]      = None
             else:
                 st.error("Failed. Check GITHUB_TOKEN and GIST_ID in Streamlit Secrets.")
     else:
@@ -426,8 +320,10 @@ if view == "admin":
 1. Go to https://share.streamlit.io → your app → Settings → Secrets
 2. Paste:
 ```toml
-GITHUB_TOKEN = "ghp_yourTokenHere"
-GIST_ID      = "yourGistIdHere"
+GITHUB_TOKEN        = "ghp_yourTokenHere"
+GIST_ID             = "yourGistIdHere"
+UBER_CLIENT_ID      = "5syO_-GOEpq7Ia_TChV9-0X57VtoRlbK"
+UBER_CLIENT_SECRET  = "your_client_secret_here"
 ```
 3. Click Save
         """)
@@ -438,23 +334,19 @@ GIST_ID      = "yourGistIdHere"
 # ════════════════════════════════════════════════════════
 elif view == "drivers":
     data = load_fleet_data()
-    st.markdown("# 🚛 SparklingBlu Moto — Your Weekly Stats")
+    st.markdown("# 🚛 SparklingBlu — Your Weekly Stats")
 
     if not data:
         st.warning("Stats not available yet. Ask your fleet manager to publish this week's data.")
         st.stop()
 
-    df          = pd.DataFrame(data["fleet"])
-    wi          = data.get("week_info", week_info)
-    updated     = data.get("updated_at", "")
-    report_days = data.get("report_days", 1)
-
-    # Always recompute KPI from raw metrics
-    df = recompute_kpi(df, report_days)
+    df      = pd.DataFrame(data["fleet"])
+    wi      = data.get("week_info", week_info)
+    updated = data.get("updated_at", "")
 
     st.markdown(
-        f"*{wi.get('day_name','—')} check-in  |  "
-        f"{wi.get('days_left','—')} day(s) left  |  Updated: {updated}*"
+        f"*{wi.get('day_name', '—')} check-in  |  "
+        f"{wi.get('days_left', '—')} day(s) left  |  Updated: {updated}*"
     )
     st.divider()
 
@@ -471,67 +363,26 @@ elif view == "drivers":
         choice  = st.selectbox("Multiple matches — select your name:", matches["Driver"].tolist())
         matches = matches[matches["Driver"] == choice]
 
-    row   = matches.iloc[0]
-    score = float(row["Score"])
-    score_color = ("#0a8a4e" if score >= 85 else
-                   "#2980b9" if score >= 70 else
-                   "#e67e22" if score >= 50 else "#c0392b")
-    status_emoji = ("🌟" if row["Status"] == "Top Performer" else
-                    "✅" if row["Status"] == "Good" else
-                    "⚠️" if row["Status"] == "Needs Improvement" else "🚨")
+    row = matches.iloc[0]
 
     st.markdown(f"""
     <div style="background:white;border-radius:16px;padding:28px 32px;
                 box-shadow:0 4px 20px rgba(0,0,0,.10);margin-bottom:18px;">
         <h2 style="margin:0 0 4px 0;color:#0f2027;">👤 {row['Driver']}</h2>
-        <p style="color:#555;margin:0 0 20px 0;font-size:15px;">Team: {row.get('Team','—')}</p>
-        <h1 style="font-size:64px;margin:0;color:{score_color};font-weight:900;">{score}</h1>
-        <p style="font-size:20px;margin:6px 0 0 0;color:#0f2027;">
-            {status_emoji} <strong>{row['Status']}</strong></p>
+        <p style="color:#555;margin:0 0 20px 0;font-size:15px;">
+            Team: {row.get('Team', '—')}
+        </p>
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("### Your KPIs This Week")
-    k1, k2, k3, k4 = st.columns(4)
-
-    def kpi_tile(col, label, value, target, on_track):
-        col.metric(f"{'✅' if on_track else '❌'} {label}", value, target)
-
-    kpi_tile(k1, "Hours Online (weekly)",
-             f"{row.get('Hours Online (weekly)',row.get('hours_weekly','—'))}h",
-             "Target: 10h/day", bool(row.get("Hours On Track", False)))
-    kpi_tile(k2, "Trips (weekly)",
-             str(row.get("Trips (weekly)", row.get("trips_weekly","—"))),
-             "Target: 5 trips/day", bool(row.get("Trips On Track", False)))
-    kpi_tile(k3, "Acceptance Rate",
-             fmt_rate(row["Confirmation Rate"]), "Target: 80%+",
-             bool(row.get("AR On Track", False)))
-    kpi_tile(k4, "Cancellation Rate",
-             fmt_rate(row["Cancellation Rate"]), "Target: max 5%",
-             bool(row.get("CR On Track", False)))
+    st.markdown("### Your Stats This Period")
+    k1, k2, k3 = st.columns(3)
+    k1.metric("⏱️ Hours Online",   f"{row.get('Hours Online',  '—')}h")
+    k2.metric("🚗 Hours on Trip",  f"{row.get('Hours on Trip', '—')}h")
+    k3.metric("📦 Total Trips",     str(row.get("Total Trips",  "—")))
 
     st.divider()
-    st.markdown("### What You Still Need By Sunday")
-    n1, n2 = st.columns(2)
-    hrs_left  = float(row.get("Hours Needed", 0))
-    trps_left = int(float(row.get("Trips Needed", 0)))
-
-    (n1.error if hrs_left > 0 else n1.success)(
-        f"⏱️ {'Still need ' + str(hrs_left) + 'h more this week' if hrs_left > 0 else 'Weekly hours target met!'}")
-    (n2.error if trps_left > 0 else n2.success)(
-        f"🚗 {'Still need ' + str(trps_left) + ' more trips this week' if trps_left > 0 else 'Weekly trips target met!'}")
-
-    ar_ok = row.get("AR On Track", False) in [True, 1, "True"]
-    cr_ok = row.get("CR On Track", False) in [True, 1, "True"]
-    (st.success if ar_ok else st.error)(
-        "📈 Acceptance rate on track!" if ar_ok else "📉 Acceptance rate below 80% — keep accepting trips!")
-    (st.success if cr_ok else st.error)(
-        "✅ Cancellation rate on track!" if cr_ok else "⚠️ Cancellation rate above 5% — reduce cancellations!")
-
-    st.divider()
-    st.markdown("### Coaching Message")
-    st.info(str(row.get("Coaching", "")))
-    st.caption(f"SparklingBlu Moto Fleet Team 🚛  |  Updated: {updated}")
+    st.caption(f"SparklingBlu Fleet Team 🚛  |  Updated: {updated}")
 
 
 # ════════════════════════════════════════════════════════
@@ -539,126 +390,98 @@ elif view == "drivers":
 # ════════════════════════════════════════════════════════
 elif view == "fleet":
     data = load_fleet_data()
-    st.markdown("# 📊 SparklingBlu Moto — Fleet Performance")
+    st.markdown("# 📊 SparklingBlu — Fleet Performance")
 
     if not data:
         st.warning("No data available. Ask the fleet manager to publish this week's stats.")
         st.stop()
 
-    df          = pd.DataFrame(data["fleet"])
-    wi          = data.get("week_info", week_info)
-    updated     = data.get("updated_at", "")
-    report_days = data.get("report_days", 1)
-    missing_sbv = data.get("missing_sbv", [])
-
-    # Always recompute KPI from raw metrics to avoid stale stored values
-    df = recompute_kpi(df, report_days)
-
-    # SBV counts derived from recomputed data
-    sbv_df    = df[df["Is SBV"] == True] if "Is SBV" in df.columns else df
-    sbv_in    = len(sbv_df)
-    sbv_tot   = data.get("sbv_total", SBV_TOTAL)
-    sbv_kpi_n = int(sbv_df["KPI Met"].sum())
-    sbv_pct   = round((sbv_kpi_n / sbv_in) * 100) if sbv_in else 0
+    df      = pd.DataFrame(data["fleet"])
+    wi      = data.get("week_info", week_info)
+    updated = data.get("updated_at", "")
 
     st.markdown(
-        f"*Management Overview  |  {wi.get('day_name','—')}  |  "
-        f"{wi.get('days_left','—')} day(s) left  |  Updated: {updated}*"
+        f"*Management Overview  |  {wi.get('day_name', '—')}  |  "
+        f"{wi.get('days_left', '—')} day(s) left  |  Updated: {updated}*"
     )
+    st.divider()
 
-    st.markdown(sbv_bar_html(
-        f'🚛 <strong style="color:#0f2027;">SBV Drivers in report:</strong>'
-        f' <span style="font-size:22px;font-weight:900;color:#0f2027;">'
-        f'&nbsp;{sbv_in} / {sbv_tot}</span>'
-        f'&nbsp;&nbsp;|&nbsp;&nbsp;'
-        f'<span style="color:#0f2027;">SBV KPI Compliant: <strong>{sbv_kpi_n}/{sbv_in}</strong>'
-        f'&nbsp;|&nbsp;SBV Compliance Rate: <strong>{sbv_pct}%</strong></span>'
-    ), unsafe_allow_html=True)
-
-    df["Score"] = df["Score"].astype(float)
+    # ── Fleet overview metrics ────────────────────────────
     total       = len(df)
-    top         = len(df[df["Score"] >= 85])
-    attention   = len(df[(df["Score"] >= 50) & (df["Score"] < 70)])
-    urgent      = len(df[df["Score"] < 50])
+    avg_hours   = round(df["Hours Online"].astype(float).mean(), 1) if "Hours Online" in df.columns else "—"
+    avg_trips   = round(df["Total Trips"].astype(float).mean(),  1) if "Total Trips"  in df.columns else "—"
+    total_trips = int(df["Total Trips"].astype(float).sum())        if "Total Trips"  in df.columns else "—"
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Drivers",          total)
-    c2.metric("Top Performers",         top)
-    c3.metric("Needs Attention",        attention)
-    c4.metric("Needs Urgent Attention", urgent)
+    c1.metric("Total Drivers",    total)
+    c2.metric("Avg Hours Online", f"{avg_hours}h")
+    c3.metric("Avg Trips",        avg_trips)
+    c4.metric("Total Trips",      total_trips)
 
     st.divider()
 
-    # Key Insights
+    # ── Key Insights ──────────────────────────────────────
     st.markdown("### Key Insights")
     i1, i2 = st.columns(2)
-    top_driver = df.loc[df["Score"].idxmax(), "Driver"]
 
     with i1:
-        st.markdown(insight_html(f"🏆 <strong>Best Driver:</strong> {top_driver} — score {df['Score'].max()}"), unsafe_allow_html=True)
-        low_ar = (df["Confirmation Rate"].astype(float) < 0.80).sum()
-        st.markdown(insight_html(f"📉 <strong>{low_ar} driver(s)</strong> below 80% acceptance rate"), unsafe_allow_html=True)
-        high_cr = (df["Cancellation Rate"].astype(float) > 0.05).sum()
-        st.markdown(insight_html(f"⚠️ <strong>{high_cr} driver(s)</strong> above 5% cancellation rate"), unsafe_allow_html=True)
+        if "Hours Online" in df.columns:
+            top_driver = df.loc[df["Hours Online"].astype(float).idxmax(), "Driver"]
+            top_hours  = df["Hours Online"].astype(float).max()
+            st.markdown(
+                insight_html(f"🏆 <strong>Most Hours Online:</strong> {top_driver} — {top_hours}h"),
+                unsafe_allow_html=True
+            )
+            low_hrs = (df["Hours Online"].astype(float) < 10).sum()
+            st.markdown(
+                insight_html(f"⏱️ <strong>{low_hrs} driver(s)</strong> with fewer than 10h online"),
+                unsafe_allow_html=True
+            )
     with i2:
-        col_h = "Hours Online (weekly)"
-        col_t = "Trips (weekly)"
-        low_hrs  = (df[col_h].astype(float) < 10).sum() if col_h in df.columns else "—"
-        low_trps = (df[col_t].astype(float) < 5).sum()  if col_t in df.columns else "—"
-        st.markdown(insight_html(f"⏱️ <strong>{low_hrs} driver(s)</strong> with fewer than 10h online"), unsafe_allow_html=True)
-        st.markdown(insight_html(f"🚗 <strong>{low_trps} driver(s)</strong> with fewer than 5 trips"), unsafe_allow_html=True)
-        compliant = int(df["KPI Met"].apply(lambda x: x in [True,1,"True","YES"]).sum())
-        fleet_pct = round((compliant/total)*100) if total else 0
-        st.markdown(insight_html(f"✅ <strong>{compliant}/{total}</strong> drivers fully KPI compliant ({fleet_pct}%)"), unsafe_allow_html=True)
+        if "Total Trips" in df.columns:
+            top_trips_driver = df.loc[df["Total Trips"].astype(float).idxmax(), "Driver"]
+            top_trips_val    = int(df["Total Trips"].astype(float).max())
+            st.markdown(
+                insight_html(f"📦 <strong>Most Trips:</strong> {top_trips_driver} — {top_trips_val} trips"),
+                unsafe_allow_html=True
+            )
+            low_trps = (df["Total Trips"].astype(float) < 5).sum()
+            st.markdown(
+                insight_html(f"🚗 <strong>{low_trps} driver(s)</strong> with fewer than 5 trips"),
+                unsafe_allow_html=True
+            )
 
     st.divider()
 
-    # Team compliance
-    st.markdown("### Team Compliance")
+    # ── Team compliance ───────────────────────────────────
+    st.markdown("### Team Breakdown")
     t_cols = st.columns(len(TEAMS))
     for i, (tn, info) in enumerate(TEAMS.items()):
-        t_df   = df[df["Team"] == tn]
-        t_n    = len(t_df)
-        t_comp = int(t_df["KPI Met"].apply(lambda x: x in [True,1,"True","YES"]).sum()) if t_n else 0
-        t_pct  = round((t_comp/t_n)*100) if t_n else 0
-        t_cols[i].metric(tn, f"{t_comp}/{t_n}", f"{t_pct}% compliant")
+        t_df      = df[df["Team"] == tn]
+        t_n       = len(t_df)
+        t_avg_hrs = round(t_df["Hours Online"].astype(float).mean(), 1) if t_n and "Hours Online" in t_df.columns else "—"
+        t_cols[i].metric(tn, f"{t_n} drivers", f"Avg {t_avg_hrs}h online")
 
     st.divider()
 
-    # SBV Exploration
-    if missing_sbv:
-        with st.expander(f"🔴 SBV Drivers NOT ONLINE this period ({len(missing_sbv)} drivers)"):
-            st.dataframe(pd.DataFrame({"Driver": sorted(missing_sbv)}),
-                         use_container_width=True, hide_index=True)
-
-    unassigned_sbv = df[(df.get("Is SBV", pd.Series(False, index=df.index)) == True) &
-                        (df["Team"] == "Unassigned")] if "Is SBV" in df.columns else pd.DataFrame()
-    if not unassigned_sbv.empty:
-        with st.expander(f"🟡 SBV Drivers NOT assigned to any team ({len(unassigned_sbv)})"):
-            ua = unassigned_sbv[["Driver","Score","Status"]].copy()
-            st.dataframe(ua.sort_values("Score", ascending=False),
-                         use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # Driver search table
+    # ── Driver search table ───────────────────────────────
     st.markdown("### Driver Search")
     search  = st.text_input("Search by name or team:", placeholder="e.g. John or Team LB")
     display = df.copy()
     if search:
-        mask = (display["Driver"].str.lower().str.contains(search.lower(), na=False) |
-                display["Team"].str.lower().str.contains(search.lower(), na=False))
+        mask = (
+            display["Driver"].str.lower().str.contains(search.lower(), na=False) |
+            display["Team"].str.lower().str.contains(search.lower(), na=False)
+        )
         display = display[mask]
 
-    show_cols = ["Driver","Team","Hours Online (weekly)","Trips (weekly)",
-                 "Confirmation Rate","Cancellation Rate","Score","Status","KPI Met"]
+    show_cols = ["Driver", "Team", "Hours Online", "Hours on Trip", "Total Trips"]
     show_cols = [c for c in show_cols if c in display.columns]
-    out = display[show_cols].copy()
-    out["Confirmation Rate"] = out["Confirmation Rate"].apply(fmt_rate)
-    out["Cancellation Rate"] = out["Cancellation Rate"].apply(fmt_rate)
-    out["KPI Met"]           = out["KPI Met"].apply(fmt_bool)
-    st.dataframe(out.sort_values("Score", ascending=False),
-                 use_container_width=True, hide_index=True)
+    st.dataframe(
+        display[show_cols].sort_values("Hours Online", ascending=False).reset_index(drop=True),
+        use_container_width=True,
+        hide_index=True
+    )
 
 
 # ════════════════════════════════════════════════════════
@@ -671,25 +494,22 @@ elif view == "team":
         st.warning("No data available. Ask the fleet manager to publish this week's stats.")
         st.stop()
 
-    df          = pd.DataFrame(data["fleet"])
-    wi          = data.get("week_info", week_info)
-    updated     = data.get("updated_at", "")
-    report_days = data.get("report_days", 1)
+    df      = pd.DataFrame(data["fleet"])
+    wi      = data.get("week_info", week_info)
+    updated = data.get("updated_at", "")
 
-    # Always recompute KPI from raw metrics
-    df = recompute_kpi(df, report_days)
-
-    selected_team = (team_param if team_param and team_param in TEAMS
-                     else st.selectbox("Select your team:", list(TEAMS.keys())))
+    selected_team = (
+        team_param if team_param and team_param in TEAMS
+        else st.selectbox("Select your team:", list(TEAMS.keys()))
+    )
 
     leader  = TEAMS[selected_team]["leader"]
     team_df = df[df["Team"] == selected_team].copy()
-    team_df["Score"] = team_df["Score"].astype(float)
 
     st.markdown(f"# 👥 {selected_team} — Weekly Performance")
     st.markdown(
-        f"*Leader: {leader}  |  {wi.get('day_name','—')}  |  "
-        f"{wi.get('days_left','—')} day(s) left  |  Updated: {updated}*"
+        f"*Leader: {leader}  |  {wi.get('day_name', '—')}  |  "
+        f"{wi.get('days_left', '—')} day(s) left  |  Updated: {updated}*"
     )
     st.divider()
 
@@ -697,29 +517,28 @@ elif view == "team":
         st.warning("No drivers found for this team in the current data.")
         st.stop()
 
-    t_total = len(team_df)
-    t_comp  = int(team_df["KPI Met"].apply(lambda x: x in [True,1,"True","YES"]).sum())
-    t_pct   = round((t_comp/t_total)*100) if t_total else 0
-    t_best  = team_df.loc[team_df["Score"].idxmax(), "Driver"]
+    t_total   = len(team_df)
+    t_avg_hrs = round(team_df["Hours Online"].astype(float).mean(), 1) if "Hours Online" in team_df.columns else "—"
+    t_avg_trp = round(team_df["Total Trips"].astype(float).mean(),  1) if "Total Trips"  in team_df.columns else "—"
+    t_best    = (team_df.loc[team_df["Hours Online"].astype(float).idxmax(), "Driver"]
+                 if "Hours Online" in team_df.columns else "—")
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Team Size",       t_total)
-    m2.metric("KPI Compliant",   f"{t_comp}/{t_total}")
-    m3.metric("Compliance Rate", f"{t_pct}%")
-    m4.metric("Top Driver",      t_best)
+    m1.metric("Team Size",        t_total)
+    m2.metric("Avg Hours Online", f"{t_avg_hrs}h")
+    m3.metric("Avg Trips",        t_avg_trp)
+    m4.metric("Most Hours",       t_best)
 
     st.divider()
 
-    show_cols = ["Driver","Hours Online (weekly)","Trips (weekly)",
-                 "Confirmation Rate","Cancellation Rate","Score","Status","KPI Met"]
+    show_cols = ["Driver", "Hours Online", "Hours on Trip", "Total Trips"]
     show_cols = [c for c in show_cols if c in team_df.columns]
-    out = team_df[show_cols].copy()
-    out["Confirmation Rate"] = out["Confirmation Rate"].apply(fmt_rate)
-    out["Cancellation Rate"] = out["Cancellation Rate"].apply(fmt_rate)
-    out["KPI Met"]           = out["KPI Met"].apply(fmt_bool)
-    st.dataframe(out.sort_values("Score", ascending=False),
-                 use_container_width=True, hide_index=True)
-    st.caption(f"SparklingBlu Moto  |  Updated: {updated}")
+    st.dataframe(
+        team_df[show_cols].sort_values("Hours Online", ascending=False).reset_index(drop=True),
+        use_container_width=True,
+        hide_index=True
+    )
+    st.caption(f"SparklingBlu Fleet  |  Updated: {updated}")
 
 else:
     st.error("Invalid link. Please ask your fleet manager for the correct link.")
