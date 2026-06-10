@@ -10,7 +10,7 @@ import streamlit as st
 TOKEN_URL    = "https://auth.uber.com/oauth/v2/token"
 ORGS_URL     = "https://api.uber.com/v1/vehicle-suppliers/orgs"
 METRICS_URL  = "https://api.uber.com/v1/vehicle-suppliers/analytics-data/query"
-SCOPE        = "solutions.suppliers.metrics.read"
+SCOPE        =  "solutions.suppliers.metrics.read vehicle_suppliers.organizations.read"
 
 # Token cache — persists for the Streamlit session
 # Uber tokens with 30-day TTL: we refresh 60s before expiry to be safe
